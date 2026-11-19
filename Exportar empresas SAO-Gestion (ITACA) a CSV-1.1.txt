@@ -1,0 +1,743 @@
+// ==UserScript==
+// @name         Exportar empresas SAO-Gestion (ITACA) a CSV
+// @namespace    empresas-zk-export
+// @version      1.1
+// @description  Exporta todas las empresas del grid ZK a CSV bajo demanda
+// @match        *://*/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const PAUSA_ENTRE_PAGINAS = 100;
+
+    let exportando = false;
+    let cancelar = false;
+
+    // ============================================================
+    // CREAR BOTÓN
+    // ============================================================
+
+    esperarGrid().then(() => {
+
+        if (document.getElementById('__btn_exportar_empresas')) {
+            return;
+        }
+
+        const boton = document.createElement('button');
+
+        boton.id = '__btn_exportar_empresas';
+        boton.textContent = '⬇ Exportar empresas CSV';
+
+        boton.style.cssText = `
+            position: fixed;
+            top: 15px;
+            right: 15px;
+            z-index: 9999999;
+            padding: 10px 16px;
+            background: #164a7b;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            box-shadow: 0 2px 8px rgba(0,0,0,.3);
+        `;
+
+        boton.addEventListener('click', async () => {
+
+            if (exportando) {
+
+                // Si está exportando, el mismo botón sirve para cancelar
+                cancelar = true;
+
+                boton.textContent = '⏳ Cancelando...';
+
+                return;
+            }
+
+            exportando = true;
+            cancelar = false;
+
+            boton.textContent = '⏳ Preparando...';
+            boton.style.background = '#a45b00';
+
+            try {
+
+                await exportarTodo(boton);
+
+            } catch (error) {
+
+                console.error('[EMPRESAS] ERROR:', error);
+
+                alert(
+                    'Error durante la exportación:\n\n' +
+                    error.message
+                );
+
+            } finally {
+
+                exportando = false;
+                cancelar = false;
+
+                boton.textContent = '⬇ Exportar empresas CSV';
+                boton.style.background = '#164a7b';
+            }
+        });
+
+        document.body.appendChild(boton);
+
+        console.log(
+            '[EMPRESAS] Exportador preparado.'
+        );
+    });
+
+
+    // ============================================================
+    // EXPORTACIÓN
+    // ============================================================
+
+    async function exportarTodo(boton) {
+
+        const paginador = obtenerPaginador();
+
+        if (!paginador) {
+            throw new Error(
+                'No encuentro el paginador.'
+            );
+        }
+
+        const totalPaginas =
+            obtenerTotalPaginas(paginador);
+
+        console.log(
+            `[EMPRESAS] Total páginas: ${totalPaginas}`
+        );
+
+
+        // ========================================================
+        // VOLVER A LA PRIMERA PÁGINA
+        // ========================================================
+
+        const paginaInicial =
+            obtenerPaginaActual(paginador);
+
+        if (paginaInicial !== 1) {
+
+            boton.textContent =
+                '⏳ Volviendo a página 1...';
+
+            await irPrimeraPagina();
+        }
+
+
+        // ========================================================
+        // RECORRER PÁGINAS
+        // ========================================================
+
+        const empresas = [];
+
+        for (
+            let pagina = 1;
+            pagina <= totalPaginas;
+            pagina++
+        ) {
+
+            if (cancelar) {
+
+                console.warn(
+                    '[EMPRESAS] Exportación cancelada.'
+                );
+
+                return;
+            }
+
+            await esperarFilas();
+
+            const empresasPagina =
+                extraerPagina();
+
+            empresas.push(
+                ...empresasPagina
+            );
+
+            boton.textContent =
+                `⏳ ${pagina}/${totalPaginas} · ${empresas.length} empresas`;
+
+            console.log(
+                `[EMPRESAS] Página ${pagina}/${totalPaginas}: ` +
+                `${empresasPagina.length} empresas`
+            );
+
+
+            // Última página
+            if (pagina >= totalPaginas) {
+                break;
+            }
+
+
+            const paginaAntes =
+                obtenerPaginaActual(
+                    obtenerPaginador()
+                );
+
+            const primerCIFAntes =
+                obtenerPrimerCIF();
+
+
+            pulsarSiguiente();
+
+
+            await esperarCambioPagina(
+                paginaAntes,
+                primerCIFAntes
+            );
+
+
+            await esperar(
+                PAUSA_ENTRE_PAGINAS
+            );
+        }
+
+
+        if (cancelar) {
+            return;
+        }
+
+
+        // ========================================================
+        // ELIMINAR DUPLICADOS
+        // ========================================================
+
+        const empresasUnicas =
+            eliminarDuplicados(empresas);
+
+
+        console.log(
+            `[EMPRESAS] Total leído: ${empresas.length}`
+        );
+
+        console.log(
+            `[EMPRESAS] Total único: ${empresasUnicas.length}`
+        );
+
+
+        boton.textContent =
+            `⏳ Generando CSV (${empresasUnicas.length})...`;
+
+
+        descargarCSV(
+            empresasUnicas
+        );
+
+
+        boton.textContent =
+            `✓ ${empresasUnicas.length} empresas exportadas`;
+
+        boton.style.background =
+            '#287a35';
+
+
+        await esperar(4000);
+    }
+
+
+    // ============================================================
+    // DETECTAR GRID
+    // ============================================================
+
+    function obtenerGrid() {
+
+        return document.querySelector(
+            '.tabla-principal.z-listbox'
+        );
+    }
+
+
+    async function esperarGrid() {
+
+        await esperarHasta(
+            () => obtenerGrid() !== null,
+            30000,
+            'No aparece el listado de empresas.'
+        );
+    }
+
+
+    // ============================================================
+    // PAGINADOR
+    // ============================================================
+
+    function obtenerPaginador() {
+
+        return document.querySelector(
+            '.itaca-paging.z-paging'
+        );
+    }
+
+
+    function obtenerPaginaActual(paginador) {
+
+        const input =
+            paginador?.querySelector(
+                '.z-paging-input'
+            );
+
+        return parseInt(
+            input?.value ?? '1',
+            10
+        );
+    }
+
+
+    function obtenerTotalPaginas(paginador) {
+
+        const texto =
+            paginador.querySelector(
+                '.z-paging-text'
+            )?.textContent ?? '';
+
+        const match =
+            texto.match(/\/\s*(\d+)/);
+
+        if (!match) {
+
+            throw new Error(
+                'No puedo determinar el número de páginas.'
+            );
+        }
+
+        return parseInt(
+            match[1],
+            10
+        );
+    }
+
+
+    // ============================================================
+    // PRIMERA PÁGINA
+    // ============================================================
+
+    async function irPrimeraPagina() {
+
+        const paginador =
+            obtenerPaginador();
+
+        if (
+            obtenerPaginaActual(paginador) === 1
+        ) {
+            return;
+        }
+
+        const boton =
+            paginador.querySelector(
+                '.z-paging-first'
+            );
+
+        if (!boton) {
+
+            throw new Error(
+                'No encuentro el botón Primera página.'
+            );
+        }
+
+
+        boton.click();
+
+
+        await esperarHasta(
+
+            () => {
+
+                const nuevo =
+                    obtenerPaginador();
+
+                return nuevo &&
+                    obtenerPaginaActual(nuevo) === 1;
+            },
+
+            15000,
+
+            'No se pudo volver a la primera página.'
+        );
+
+
+        await esperarFilas();
+    }
+
+
+    // ============================================================
+    // SIGUIENTE
+    // ============================================================
+
+    function pulsarSiguiente() {
+
+        const paginador =
+            obtenerPaginador();
+
+        const boton =
+            paginador.querySelector(
+                '.z-paging-next'
+            );
+
+        if (!boton) {
+
+            throw new Error(
+                'No encuentro Página Siguiente.'
+            );
+        }
+
+        boton.click();
+    }
+
+
+    // ============================================================
+    // ESPERAR CAMBIO DE PÁGINA
+    // ============================================================
+
+    async function esperarCambioPagina(
+        paginaAnterior,
+        cifAnterior
+    ) {
+
+        await esperarHasta(
+
+            () => {
+
+                const paginador =
+                    obtenerPaginador();
+
+                if (!paginador) {
+                    return false;
+                }
+
+                const nuevaPagina =
+                    obtenerPaginaActual(
+                        paginador
+                    );
+
+                const nuevoCIF =
+                    obtenerPrimerCIF();
+
+
+                return (
+                    nuevaPagina !== paginaAnterior &&
+                    nuevoCIF &&
+                    nuevoCIF !== cifAnterior
+                );
+            },
+
+            15000,
+
+            `Timeout cambiando desde página ${paginaAnterior}.`
+        );
+    }
+
+
+    // ============================================================
+    // ESPERAR FILAS
+    // ============================================================
+
+    async function esperarFilas() {
+
+        await esperarHasta(
+
+            () =>
+                document.querySelectorAll(
+                    '.tabla-principal ' +
+                    '.z-listbox-body ' +
+                    'tr.z-listitem'
+                ).length > 0,
+
+            10000,
+
+            'No aparecen filas en la tabla.'
+        );
+    }
+
+
+    // ============================================================
+    // EXTRAER PÁGINA
+    // ============================================================
+
+    function extraerPagina() {
+
+        const filas = [
+            ...document.querySelectorAll(
+                '.tabla-principal ' +
+                '.z-listbox-body ' +
+                'tr.z-listitem'
+            )
+        ];
+
+
+        return filas.map(fila => {
+
+            const celdas = [
+                ...fila.querySelectorAll(
+                    ':scope > td.z-listcell'
+                )
+            ];
+
+
+            return {
+
+                CIF:
+                    textoCelda(celdas[1]),
+
+                Empresa:
+                    textoCelda(celdas[2]),
+
+                Provincia:
+                    textoCelda(celdas[3]),
+
+                Localidad:
+                    textoCelda(celdas[4]),
+
+                Gerente:
+                    textoCelda(celdas[5]),
+
+                Activa:
+                    textoCelda(celdas[6]),
+
+                "Dependiente GVA":
+                    textoCelda(celdas[7])
+            };
+        });
+    }
+
+
+    function textoCelda(celda) {
+
+        return limpiar(
+            celda?.textContent ?? ''
+        );
+    }
+
+
+    function obtenerPrimerCIF() {
+
+        const celda =
+            document.querySelector(
+                '.tabla-principal ' +
+                '.z-listbox-body ' +
+                'tr.z-listitem ' +
+                'td.z-listcell:nth-child(2)'
+            );
+
+        return limpiar(
+            celda?.textContent ?? ''
+        );
+    }
+
+
+    // ============================================================
+    // LIMPIEZA
+    // ============================================================
+
+    function limpiar(texto) {
+
+        return String(texto ?? '')
+            .replace(/\u00a0/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+
+    // ============================================================
+    // DUPLICADOS
+    // ============================================================
+
+    function eliminarDuplicados(datos) {
+
+        const vistos =
+            new Set();
+
+        return datos.filter(
+            empresa => {
+
+                const clave =
+                    empresa.CIF;
+
+                if (!clave) {
+                    return true;
+                }
+
+                if (vistos.has(clave)) {
+                    return false;
+                }
+
+                vistos.add(clave);
+
+                return true;
+            }
+        );
+    }
+
+
+    // ============================================================
+    // CSV
+    // ============================================================
+
+    function descargarCSV(datos) {
+
+        if (!datos.length) {
+
+            throw new Error(
+                'No se ha obtenido ningún registro.'
+            );
+        }
+
+
+        const columnas =
+            Object.keys(datos[0]);
+
+
+        const escapar =
+            valor => {
+
+                let texto =
+                    String(valor ?? '');
+
+                texto =
+                    texto.replace(
+                        /"/g,
+                        '""'
+                    );
+
+                return `"${texto}"`;
+            };
+
+
+        const filas = [];
+
+
+        filas.push(
+            columnas
+                .map(escapar)
+                .join(';')
+        );
+
+
+        for (const empresa of datos) {
+
+            filas.push(
+
+                columnas
+                    .map(
+                        columna =>
+                            escapar(
+                                empresa[columna]
+                            )
+                    )
+                    .join(';')
+            );
+        }
+
+
+        const csv =
+            '\uFEFF' +
+            filas.join('\r\n');
+
+
+        const blob =
+            new Blob(
+                [csv],
+                {
+                    type:
+                        'text/csv;charset=utf-8'
+                }
+            );
+
+
+        const url =
+            URL.createObjectURL(blob);
+
+
+        const enlace =
+            document.createElement('a');
+
+        enlace.href = url;
+
+        enlace.download =
+            `empresas_nueva_plataforma_${fechaActual()}.csv`;
+
+
+        document.body.appendChild(
+            enlace
+        );
+
+        enlace.click();
+
+        enlace.remove();
+
+
+        setTimeout(
+            () => URL.revokeObjectURL(url),
+            1000
+        );
+    }
+
+
+    // ============================================================
+    // UTILIDADES
+    // ============================================================
+
+    function esperar(ms) {
+
+        return new Promise(
+            resolve =>
+                setTimeout(resolve, ms)
+        );
+    }
+
+
+    async function esperarHasta(
+        condicion,
+        timeout,
+        mensajeError
+    ) {
+
+        const inicio =
+            Date.now();
+
+        while (
+            Date.now() - inicio < timeout
+        ) {
+
+            if (condicion()) {
+                return;
+            }
+
+            await esperar(50);
+        }
+
+        throw new Error(
+            mensajeError
+        );
+    }
+
+
+    function fechaActual() {
+
+        const d =
+            new Date();
+
+        return [
+            d.getFullYear(),
+
+            String(
+                d.getMonth() + 1
+            ).padStart(2, '0'),
+
+            String(
+                d.getDate()
+            ).padStart(2, '0')
+
+        ].join('-');
+    }
+
+})();

@@ -1,0 +1,476 @@
+// ==UserScript==
+// @name         Exportar empresas FCT a CSV
+// @namespace    fct-export
+// @version      1.0
+// @description  Recorre todas las páginas del listado de empresas FCT y exporta un CSV
+// @match        *://*/index.php*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // Solo se activa si estamos realmente en el listado de empresas.
+    if (!document.querySelector('.tablaListadoFCTs')) {
+        return;
+    }
+
+    // ============================================================
+    // BOTÓN
+    // ============================================================
+
+    const boton = document.createElement('button');
+    boton.textContent = '⬇ Exportar empresas a CSV';
+
+    boton.style.cssText = `
+        position: fixed;
+        top: 15px;
+        right: 15px;
+        z-index: 999999;
+        padding: 10px 15px;
+        background: #164a7b;
+        color: white;
+        border: 0;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: bold;
+        box-shadow: 0 2px 6px rgba(0,0,0,.25);
+    `;
+
+    document.body.appendChild(boton);
+
+    boton.addEventListener('click', exportar);
+
+
+    // ============================================================
+    // EXPORTACIÓN PRINCIPAL
+    // ============================================================
+
+    async function exportar() {
+
+        boton.disabled = true;
+
+        try {
+
+            const totalPaginas = obtenerTotalPaginas();
+
+            console.log(
+                `[FCT] Total de páginas detectadas: ${totalPaginas}`
+            );
+
+            const todasLasEmpresas = [];
+
+            for (let pagina = 1; pagina <= totalPaginas; pagina++) {
+
+                boton.textContent =
+                    `Descargando ${pagina}/${totalPaginas}...`;
+
+                console.log(
+                    `[FCT] Descargando página ${pagina}/${totalPaginas}`
+                );
+
+                const documento = await descargarPagina(pagina);
+
+                const empresas = extraerEmpresas(documento);
+
+                console.log(
+                    `[FCT] Página ${pagina}: ${empresas.length} empresas`
+                );
+
+                todasLasEmpresas.push(...empresas);
+
+                // Pausa ligera para no bombardear el servidor.
+                await esperar(150);
+            }
+
+            console.log(
+                `[FCT] TOTAL: ${todasLasEmpresas.length} empresas`
+            );
+
+            boton.textContent =
+                `Generando CSV (${todasLasEmpresas.length})...`;
+
+            descargarCSV(todasLasEmpresas);
+
+            boton.textContent =
+                `✓ ${todasLasEmpresas.length} empresas exportadas`;
+
+        } catch (error) {
+
+            console.error('[FCT] ERROR:', error);
+
+            alert(
+                'Ha ocurrido un error durante la exportación:\n\n' +
+                error.message
+            );
+
+            boton.textContent = '❌ Error';
+
+        } finally {
+
+            setTimeout(() => {
+                boton.disabled = false;
+                boton.textContent = '⬇ Exportar empresas a CSV';
+            }, 4000);
+        }
+    }
+
+
+    // ============================================================
+    // DETECTAR NÚMERO TOTAL DE PÁGINAS
+    // ============================================================
+
+    function obtenerTotalPaginas() {
+
+        const numeros = [];
+
+        // Página actual
+        const paginaActual =
+            document.querySelector('.enlacePagSelec');
+
+        if (paginaActual) {
+
+            const n = parseInt(
+                paginaActual.textContent.trim(),
+                10
+            );
+
+            if (!isNaN(n)) {
+                numeros.push(n);
+            }
+        }
+
+        // Resto de páginas
+        document
+            .querySelectorAll('a.enlacePag')
+            .forEach(enlace => {
+
+                try {
+
+                    const url =
+                        new URL(enlace.href, location.href);
+
+                    const pag =
+                        parseInt(
+                            url.searchParams.get('pag'),
+                            10
+                        );
+
+                    if (!isNaN(pag)) {
+                        numeros.push(pag);
+                    }
+
+                } catch (e) {
+                    // Ignorar enlaces que no sean páginas.
+                }
+            });
+
+        if (!numeros.length) {
+            return 1;
+        }
+
+        return Math.max(...numeros);
+    }
+
+
+    // ============================================================
+    // DESCARGAR UNA PÁGINA
+    // ============================================================
+
+    async function descargarPagina(numeroPagina) {
+
+        /*
+         * Partimos de la URL actual.
+         *
+         * Así conservamos filtros como:
+         *
+         * activos=si
+         * localidad=Elche
+         * cat=15
+         * orden=nombre
+         * sentido=asc
+         *
+         * y únicamente cambiamos "pag".
+         */
+
+        const url =
+            new URL(location.href);
+
+        url.searchParams.set(
+            'pag',
+            numeroPagina
+        );
+
+        const response = await fetch(
+            url.toString(),
+            {
+                credentials: 'same-origin',
+                cache: 'no-store'
+            }
+        );
+
+        if (!response.ok) {
+
+            throw new Error(
+                `Página ${numeroPagina}: HTTP ${response.status}`
+            );
+        }
+
+        const html =
+            await response.text();
+
+        return new DOMParser()
+            .parseFromString(
+                html,
+                'text/html'
+            );
+    }
+
+
+    // ============================================================
+    // EXTRAER EMPRESAS
+    // ============================================================
+
+    function extraerEmpresas(doc) {
+
+        /*
+         * IMPORTANTE:
+         *
+         * NO usamos:
+         *
+         *      .filaParListadoFCT
+         *
+         * porque solamente identifica las filas pares.
+         *
+         * Todas las empresas tienen un ID:
+         *
+         *      empresa123456
+         *
+         * Por eso seleccionamos:
+         *
+         *      tr[id^="empresa"]
+         */
+
+        const filas = [
+            ...doc.querySelectorAll(
+                '.tablaListadoFCTs tr[id^="empresa"]'
+            )
+        ];
+
+        return filas.map(fila => {
+
+            const celdas = [
+                ...fila.querySelectorAll(':scope > td')
+            ];
+
+            const valor = indice =>
+                limpiar(
+                    celdas[indice]?.textContent ?? ''
+                );
+
+            const idEmpresa =
+                fila.id.replace(/^empresa/, '');
+
+            // Enlace de detalles
+            const enlaceDetalles =
+                celdas[1]?.querySelector(
+                    'a[href*="idEmpresa"]'
+                );
+
+            let urlDetalles = '';
+
+            if (enlaceDetalles) {
+
+                urlDetalles =
+                    new URL(
+                        enlaceDetalles.getAttribute('href'),
+                        location.href
+                    ).href;
+            }
+
+            // Activo aparece en el ALT de la imagen:
+            // alt="Si" / alt="No"
+            const imagenActivo =
+                celdas[10]?.querySelector('img');
+
+            const activo =
+                imagenActivo?.getAttribute('alt')
+                ?? valor(10);
+
+            return {
+
+                ID: idEmpresa,
+
+                CIF: valor(0),
+
+                Nombre: valor(1),
+
+                "Convenio FCT": valor(2),
+
+                "Fecha firma FCT": valor(3),
+
+                "Convenio DUAL": valor(4),
+
+                "Fecha firma DUAL": valor(5),
+
+                Localidad: valor(6),
+
+                Gerente: valor(7),
+
+                Usuario: valor(8),
+
+                Tipo: valor(9),
+
+                Activo: activo,
+
+                Registrado: valor(11),
+
+                "Último acceso": valor(12),
+
+                "URL detalles": urlDetalles
+            };
+        });
+    }
+
+
+    // ============================================================
+    // LIMPIAR TEXTO
+    // ============================================================
+
+    function limpiar(texto) {
+
+        return texto
+            .replace(/\u00a0/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+
+    // ============================================================
+    // GENERAR CSV
+    // ============================================================
+
+    function descargarCSV(datos) {
+
+        if (!datos.length) {
+
+            throw new Error(
+                'No se ha encontrado ninguna empresa.'
+            );
+        }
+
+        const columnas =
+            Object.keys(datos[0]);
+
+        const escapar = valor => {
+
+            let texto =
+                String(valor ?? '');
+
+            texto =
+                texto.replace(/"/g, '""');
+
+            return `"${texto}"`;
+        };
+
+        const lineas = [];
+
+        // Cabecera
+        lineas.push(
+            columnas
+                .map(escapar)
+                .join(';')
+        );
+
+        // Datos
+        for (const fila of datos) {
+
+            lineas.push(
+                columnas
+                    .map(columna =>
+                        escapar(fila[columna])
+                    )
+                    .join(';')
+            );
+        }
+
+        /*
+         * BOM UTF-8 para que Excel abra bien:
+         * ñ, tildes, etc.
+         *
+         * Separador ; porque Excel español
+         * suele reconocerlo directamente.
+         */
+
+        const csv =
+            '\uFEFF' +
+            lineas.join('\r\n');
+
+        const blob =
+            new Blob(
+                [csv],
+                {
+                    type:
+                        'text/csv;charset=utf-8'
+                }
+            );
+
+        const blobURL =
+            URL.createObjectURL(blob);
+
+        const enlace =
+            document.createElement('a');
+
+        enlace.href = blobURL;
+
+        enlace.download =
+            `empresas_FCT_${fechaActual()}.csv`;
+
+        document.body.appendChild(enlace);
+
+        enlace.click();
+
+        enlace.remove();
+
+        setTimeout(
+            () => URL.revokeObjectURL(blobURL),
+            1000
+        );
+    }
+
+
+    // ============================================================
+    // UTILIDADES
+    // ============================================================
+
+    function esperar(ms) {
+
+        return new Promise(
+            resolve => setTimeout(resolve, ms)
+        );
+    }
+
+
+    function fechaActual() {
+
+        const fecha = new Date();
+
+        const yyyy =
+            fecha.getFullYear();
+
+        const mm =
+            String(
+                fecha.getMonth() + 1
+            ).padStart(2, '0');
+
+        const dd =
+            String(
+                fecha.getDate()
+            ).padStart(2, '0');
+
+        return `${yyyy}-${mm}-${dd}`;
+    }
+
+})();

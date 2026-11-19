@@ -1,0 +1,196 @@
+// ==UserScript==
+// @name         Exportar participantes Aules a CSV
+// @namespace    aules-participantes-export
+// @version      1.0
+// @description  Exporta los participantes de un curso de Aules (filas con data-fullname) a CSV
+// @match        https://aules.edu.gva.es/*/user/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ============================================================
+    // CONFIGURACIÓN
+    // ============================================================
+
+    const SEL_ITEM = '[data-fullname]';
+    const ID_BOTON = '__btn_exportar_aules';
+
+    // Texto que no se ve en pantalla y ensucia las celdas (lectores de pantalla, iniciales del avatar...)
+    const SEL_OCULTOS = '.sr-only, .visually-hidden, .accesshide, .userinitials, script, style';
+
+    // Columnas fijas al principio; el resto se sacan de las cabeceras de la tabla
+    const COLUMNAS_FIJAS = ['ID', 'Nombre completo'];
+
+    // ============================================================
+    // BOTÓN (espera a que haya [data-fullname]; si no aparece, no pinta nada)
+    // ============================================================
+
+    esperarHasta(() => document.querySelector(SEL_ITEM), 30000)
+        .then(crearBoton)
+        .catch(() => { /* esta página no tiene participantes: no hacemos nada */ });
+
+    function crearBoton() {
+        if (document.getElementById(ID_BOTON)) return;
+
+        const boton = document.createElement('button');
+        boton.id = ID_BOTON;
+        boton.textContent = '⬇ Exportar participantes CSV';
+        boton.style.cssText = `
+            position: fixed; top: 70px; right: 15px; z-index: 9999999;
+            padding: 10px 16px; background: #164a7b; color: white;
+            border: none; border-radius: 6px; cursor: pointer;
+            font-size: 14px; font-weight: bold;
+            box-shadow: 0 2px 8px rgba(0,0,0,.3);
+        `;
+
+        boton.addEventListener('click', async () => {
+            try {
+                if (hayPaginacion() && !confirm(
+                    'La tabla está paginada: solo se exportará la página visible.\n\n' +
+                    'Pulsa "Mostrar todos" antes si quieres el listado completo.\n\n¿Exportar igualmente?'
+                )) return;
+
+                const { columnas, datos } = extraer();
+                console.log(`[AULES] ${datos.length} participantes`, datos);
+                descargarCSV(columnas, datos);
+                boton.textContent = `✓ ${datos.length} participantes exportados`;
+                boton.style.background = '#287a35';
+            } catch (error) {
+                console.error('[AULES] ERROR:', error);
+                alert('Error durante la exportación:\n\n' + error.message);
+            }
+            await esperar(4000);
+            boton.textContent = '⬇ Exportar participantes CSV';
+            boton.style.background = '#164a7b';
+        });
+
+        document.body.appendChild(boton);
+        console.log('[AULES] Exportador preparado.');
+    }
+
+    // ============================================================
+    // EXTRACCIÓN
+    // ============================================================
+
+    function extraer() {
+        // Un mismo alumno tiene varios [data-fullname] en su fila (estado, editar matrícula, desmatricular...)
+        // -> la clave es la fila <tr>; si no hay fila, el propio nombre
+        const vistos = new Set();
+        const columnas = [...COLUMNAS_FIJAS];
+        const datos = [];
+
+        for (const el of document.querySelectorAll(SEL_ITEM)) {
+            const nombre = limpiar(el.getAttribute('data-fullname'));
+            if (!nombre) continue;
+
+            const fila = el.closest('tr');
+            const clave = fila ?? nombre;
+            if (vistos.has(clave)) continue;
+            vistos.add(clave);
+
+            const r = fila ? extraerFila(fila, nombre) : { 'ID': '', 'Nombre completo': nombre };
+            for (const c of Object.keys(r)) if (!columnas.includes(c)) columnas.push(c);
+            datos.push(r);
+        }
+
+        if (!datos.length) throw new Error('No he encontrado ningún participante.');
+        return { columnas, datos };
+    }
+
+    function extraerFila(fila, nombre) {
+        const r = { 'ID': '', 'Nombre completo': nombre };
+        const cabeceras = cabecerasDe(fila.closest('table'));
+
+        [...fila.children].forEach((celda, i) => {
+            // Columna del nombre: de aquí solo sacamos el id de usuario (el nombre ya viene de data-fullname)
+            const perfil = celda.querySelector('a[href*="/user/view.php"]');
+            if (perfil) {
+                r['ID'] = new URL(perfil.href).searchParams.get('id') ?? '';
+                return;
+            }
+            const cab = cabeceras[i];
+            if (!cab) return; // columna del checkbox u otras sin título
+            r[cab] = textoVisible(celda);
+        });
+
+        return r;
+    }
+
+    // Cabeceras por índice de columna (cacheadas por tabla)
+    const cacheCabeceras = new WeakMap();
+    function cabecerasDe(tabla) {
+        if (!tabla) return [];
+        if (cacheCabeceras.has(tabla)) return cacheCabeceras.get(tabla);
+        const ths = tabla.querySelectorAll('thead tr:last-child > th, thead tr:last-child > td');
+        const cabeceras = [...ths].map(th => textoVisible(th));
+        cacheCabeceras.set(tabla, cabeceras);
+        return cabeceras;
+    }
+
+    function textoVisible(nodo) {
+        const copia = nodo.cloneNode(true);
+        copia.querySelectorAll(SEL_OCULTOS).forEach(e => e.remove());
+        return limpiar(copia.textContent);
+    }
+
+    function hayPaginacion() {
+        return !!document.querySelector('.pagination .page-item:nth-child(2), a[data-action="showcount"]');
+    }
+
+    // ============================================================
+    // CSV
+    // ============================================================
+
+    function descargarCSV(columnas, datos) {
+        const escapar = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+
+        const filas = [columnas.map(escapar).join(';')];
+        for (const r of datos) filas.push(columnas.map(c => escapar(r[c])).join(';'));
+
+        const blob = new Blob(['\uFEFF' + filas.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `participantes_aules_${idCurso()}${fechaActual()}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    // user/index.php?id=XXXX -> mete el id del curso en el nombre del fichero
+    function idCurso() {
+        const id = new URLSearchParams(location.search).get('id');
+        return id ? `curso${id}_` : '';
+    }
+
+    // ============================================================
+    // UTILIDADES
+    // ============================================================
+
+    function limpiar(texto) {
+        return String(texto ?? '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function esperar(ms) {
+        return new Promise(r => setTimeout(r, ms));
+    }
+
+    async function esperarHasta(condicion, timeout) {
+        const inicio = Date.now();
+        while (Date.now() - inicio < timeout) {
+            if (condicion()) return;
+            await esperar(200);
+        }
+        throw new Error('timeout');
+    }
+
+    function fechaActual() {
+        const d = new Date();
+        return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'),
+            String(d.getDate()).padStart(2, '0')].join('-');
+    }
+})();

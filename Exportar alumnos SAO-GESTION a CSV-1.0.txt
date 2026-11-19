@@ -1,0 +1,341 @@
+// ==UserScript==
+// @name         Exportar alumnos SAO-GESTION a CSV
+// @namespace    alumnos-zk-export
+// @version      1.0
+// @description  Exporta el grid de alumnos (ZK) a CSV, con o sin paginador
+// @match        *://*/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ============================================================
+    // CONFIGURACIÓN
+    // ============================================================
+
+    const PAUSA_ENTRE_PAGINAS = 100;
+    const PAUSA_SCROLL = 150;          // espera tras cada scroll (render on demand de ZK)
+    const COLUMNA_CLAVE = 'NIA';       // para deduplicar y detectar cambio de página
+
+    // Columnas que Excel destrozaría (ceros a la izquierda, notación científica).
+    // Se exportan como ="valor" para que Excel las trate como texto.
+    // Pon [] si vas a procesar el CSV con pandas/LibreOffice y no lo quieres.
+    const COLUMNAS_TEXTO_EXCEL = ['NIA', 'Documento', 'NUSS'];
+
+    // Columnas a excluir del CSV (por título de cabecera)
+    const COLUMNAS_EXCLUIDAS = [];
+
+    const SEL_GRID = '.tabla-principal.z-listbox';
+    const SEL_PAGINADOR = '.itaca-paging.z-paging';
+
+    let exportando = false;
+    let cancelar = false;
+
+    // ============================================================
+    // BOTÓN
+    // ============================================================
+
+    esperarGrid().then(() => {
+        if (document.getElementById('__btn_exportar_alumnos')) return;
+
+        const boton = document.createElement('button');
+        boton.id = '__btn_exportar_alumnos';
+        boton.textContent = '⬇ Exportar alumnos CSV';
+        boton.style.cssText = `
+            position: fixed; top: 15px; right: 15px; z-index: 9999999;
+            padding: 10px 16px; background: #164a7b; color: white;
+            border: none; border-radius: 6px; cursor: pointer;
+            font-size: 14px; font-weight: bold;
+            box-shadow: 0 2px 8px rgba(0,0,0,.3);
+        `;
+
+        boton.addEventListener('click', async () => {
+            if (exportando) {
+                cancelar = true;
+                boton.textContent = '⏳ Cancelando...';
+                return;
+            }
+
+            exportando = true;
+            cancelar = false;
+            boton.textContent = '⏳ Preparando...';
+            boton.style.background = '#a45b00';
+
+            try {
+                await exportarTodo(boton);
+            } catch (error) {
+                console.error('[ALUMNOS] ERROR:', error);
+                alert('Error durante la exportación:\n\n' + error.message);
+            } finally {
+                exportando = false;
+                cancelar = false;
+                boton.textContent = '⬇ Exportar alumnos CSV';
+                boton.style.background = '#164a7b';
+            }
+        });
+
+        document.body.appendChild(boton);
+        console.log('[ALUMNOS] Exportador preparado.');
+    }).catch(() => { /* esta página no tiene el grid: no hacemos nada */ });
+
+    // ============================================================
+    // EXPORTACIÓN
+    // ============================================================
+
+    async function exportarTodo(boton) {
+        const columnas = leerColumnas();
+        console.log('[ALUMNOS] Columnas:', columnas.map(c => c.titulo));
+
+        if (!columnas.some(c => c.titulo === COLUMNA_CLAVE)) {
+            throw new Error(`No encuentro la columna clave "${COLUMNA_CLAVE}".`);
+        }
+
+        const paginador = obtenerPaginador();
+        const totalPaginas = paginador ? obtenerTotalPaginas(paginador) : 1;
+        console.log(`[ALUMNOS] Paginador: ${paginador ? 'sí' : 'no'} · páginas: ${totalPaginas}`);
+
+        if (paginador && obtenerPaginaActual(paginador) !== 1) {
+            boton.textContent = '⏳ Volviendo a página 1...';
+            await irPrimeraPagina();
+        }
+
+        // Map por clave => deduplica sobre la marcha (útil con el scroll)
+        const registros = new Map();
+        let sinClave = [];
+
+        for (let pagina = 1; pagina <= totalPaginas; pagina++) {
+            if (cancelar) { console.warn('[ALUMNOS] Cancelado.'); return; }
+
+            await esperarFilas();
+
+            const filasPagina = await recolectarConScroll(columnas);
+            for (const r of filasPagina) {
+                const clave = r[COLUMNA_CLAVE];
+                if (clave) registros.set(clave, r);
+                else sinClave.push(r);
+            }
+
+            boton.textContent = `⏳ ${pagina}/${totalPaginas} · ${registros.size} alumnos`;
+            console.log(`[ALUMNOS] Página ${pagina}/${totalPaginas}: ${filasPagina.length} filas`);
+
+            if (pagina >= totalPaginas) break;
+
+            const paginaAntes = obtenerPaginaActual(obtenerPaginador());
+            const claveAntes = obtenerPrimeraClave(columnas);
+
+            pulsarSiguiente();
+            await esperarCambioPagina(paginaAntes, claveAntes, columnas);
+            await esperar(PAUSA_ENTRE_PAGINAS);
+        }
+
+        if (cancelar) return;
+
+        const datos = [...registros.values(), ...sinClave];
+        console.log(`[ALUMNOS] Total único: ${datos.length}`);
+
+        boton.textContent = `⏳ Generando CSV (${datos.length})...`;
+        descargarCSV(datos, columnas.map(c => c.titulo));
+
+        boton.textContent = `✓ ${datos.length} alumnos exportados`;
+        boton.style.background = '#287a35';
+        await esperar(4000);
+    }
+
+    // ============================================================
+    // GRID Y COLUMNAS
+    // ============================================================
+
+    // Si hay varias pestañas con .tabla-principal, coge la visible
+    function obtenerGrid() {
+        const grids = [...document.querySelectorAll(SEL_GRID)];
+        return grids.find(g => g.offsetParent !== null) ?? grids[0] ?? null;
+    }
+
+    async function esperarGrid() {
+        await esperarHasta(() => obtenerGrid() !== null, 30000, 'No aparece el listado.');
+    }
+
+    // Lee las cabeceras del propio grid: índice de celda + título.
+    // Se salta la columna check oculta y la barra de scroll.
+    function leerColumnas() {
+        const ths = [...obtenerGrid().querySelectorAll('.z-listbox-header tr.z-listhead > th')];
+        const columnas = [];
+
+        ths.forEach((th, indice) => {
+            if (th.classList.contains('z-listhead-bar')) return;
+            if (th.classList.contains('columna-check')) return;
+
+            const titulo = limpiar(th.getAttribute('title') || th.textContent);
+            if (!titulo || COLUMNAS_EXCLUIDAS.includes(titulo)) return;
+
+            columnas.push({ indice, titulo });
+        });
+
+        if (!columnas.length) throw new Error('No encuentro las cabeceras del grid.');
+        return columnas;
+    }
+
+    function filasBody() {
+        return [...obtenerGrid().querySelectorAll('.z-listbox-body tbody[id$="-rows"] > tr.z-listitem')];
+    }
+
+    function extraerFila(fila, columnas) {
+        const celdas = fila.querySelectorAll(':scope > td.z-listcell');
+        const registro = {};
+        for (const { indice, titulo } of columnas) {
+            registro[titulo] = limpiar(celdas[indice]?.textContent ?? '');
+        }
+        return registro;
+    }
+
+    function extraerVisibles(columnas) {
+        return filasBody()
+            .map(f => extraerFila(f, columnas))
+            .filter(r => Object.values(r).some(v => v !== ''));   // descarta placeholders vacíos
+    }
+
+    // ZK puede renderizar bajo demanda (ROD): las filas fuera de la vista
+    // llegan vacías hasta que haces scroll. Recorremos el body a saltos.
+    async function recolectarConScroll(columnas) {
+        const body = obtenerGrid().querySelector('.z-listbox-body');
+        const acumulado = new Map();
+        const meter = lista => lista.forEach((r, i) =>
+            acumulado.set(r[columnas[0].titulo] ? JSON.stringify(r) : `__${i}`, r));
+
+        meter(extraerVisibles(columnas));
+
+        if (body && body.scrollHeight > body.clientHeight + 5) {
+            const paso = Math.max(body.clientHeight - 40, 100);
+            for (let y = 0; y <= body.scrollHeight; y += paso) {
+                if (cancelar) break;
+                body.scrollTop = y;
+                body.dispatchEvent(new Event('scroll'));
+                await esperar(PAUSA_SCROLL);
+                meter(extraerVisibles(columnas));
+            }
+            body.scrollTop = 0;
+            body.dispatchEvent(new Event('scroll'));
+        }
+
+        return [...acumulado.values()];
+    }
+
+    function obtenerPrimeraClave(columnas) {
+        const col = columnas.find(c => c.titulo === COLUMNA_CLAVE);
+        const fila = filasBody()[0];
+        return fila ? limpiar(fila.querySelectorAll(':scope > td.z-listcell')[col.indice]?.textContent ?? '') : '';
+    }
+
+    async function esperarFilas() {
+        await esperarHasta(() => filasBody().length > 0, 10000, 'No aparecen filas en la tabla.');
+    }
+
+    // ============================================================
+    // PAGINADOR
+    // ============================================================
+
+    function obtenerPaginador() {
+        const ps = [...document.querySelectorAll(SEL_PAGINADOR)];
+        return ps.find(p => p.offsetParent !== null) ?? ps[0] ?? null;
+    }
+
+    function obtenerPaginaActual(paginador) {
+        return parseInt(paginador?.querySelector('.z-paging-input')?.value ?? '1', 10);
+    }
+
+    function obtenerTotalPaginas(paginador) {
+        const texto = paginador.querySelector('.z-paging-text')?.textContent ?? '';
+        const m = texto.match(/\/\s*(\d+)/);
+        if (!m) throw new Error('No puedo determinar el número de páginas.');
+        return parseInt(m[1], 10);
+    }
+
+    async function irPrimeraPagina() {
+        const boton = obtenerPaginador().querySelector('.z-paging-first');
+        if (!boton) throw new Error('No encuentro el botón Primera página.');
+        boton.click();
+        await esperarHasta(() => obtenerPaginaActual(obtenerPaginador()) === 1,
+            15000, 'No se pudo volver a la primera página.');
+        await esperarFilas();
+    }
+
+    function pulsarSiguiente() {
+        const boton = obtenerPaginador()?.querySelector('.z-paging-next');
+        if (!boton) throw new Error('No encuentro Página Siguiente.');
+        boton.click();
+    }
+
+    async function esperarCambioPagina(paginaAnterior, claveAnterior, columnas) {
+        await esperarHasta(() => {
+            const p = obtenerPaginador();
+            if (!p) return false;
+            const clave = obtenerPrimeraClave(columnas);
+            return obtenerPaginaActual(p) !== paginaAnterior && clave && clave !== claveAnterior;
+        }, 15000, `Timeout cambiando desde página ${paginaAnterior}.`);
+    }
+
+    // ============================================================
+    // CSV
+    // ============================================================
+
+    function descargarCSV(datos, columnas) {
+        if (!datos.length) throw new Error('No se ha obtenido ningún registro.');
+
+        const escapar = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+        const celda = (col, v) =>
+            COLUMNAS_TEXTO_EXCEL.includes(col) && v !== '' ? escapar(`="${v}"`) : escapar(v);
+
+        const filas = [columnas.map(escapar).join(';')];
+        for (const r of datos) filas.push(columnas.map(c => celda(c, r[c])).join(';'));
+
+        const blob = new Blob(['\uFEFF' + filas.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `alumnos_itaca_${grupoFiltrado()}${fechaActual()}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    // Si hay filtro de Grupo puesto, lo mete en el nombre del fichero
+    function grupoFiltrado() {
+        const grid = obtenerGrid();
+        const ths = [...grid.querySelectorAll('.z-listbox-header tr.z-listhead > th')];
+        const idx = ths.findIndex(th => limpiar(th.getAttribute('title')) === 'Grupo');
+        if (idx < 0) return '';
+        const aux = grid.querySelectorAll('.z-listbox-header tr.z-auxhead > th')[idx];
+        const valor = limpiar(aux?.querySelector('input.z-textbox')?.value ?? '');
+        return valor ? valor.replace(/[^\w-]/g, '_') + '_' : '';
+    }
+
+    // ============================================================
+    // UTILIDADES
+    // ============================================================
+
+    function limpiar(texto) {
+        return String(texto ?? '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function esperar(ms) {
+        return new Promise(r => setTimeout(r, ms));
+    }
+
+    async function esperarHasta(condicion, timeout, mensajeError) {
+        const inicio = Date.now();
+        while (Date.now() - inicio < timeout) {
+            if (condicion()) return;
+            await esperar(50);
+        }
+        throw new Error(mensajeError);
+    }
+
+    function fechaActual() {
+        const d = new Date();
+        return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'),
+            String(d.getDate()).padStart(2, '0')].join('-');
+    }
+})();

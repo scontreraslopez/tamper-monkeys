@@ -1,0 +1,476 @@
+// ==UserScript==
+// @name         ITACA · Exportar matrículas (recorrido alumno a alumno)
+// @namespace    itaca-matriculas-csv
+// @version      3.0
+// @description  Recorre la ficha de matrícula con "Siguiente" y exporta alumno, grupo, repite, modalidad, horas y módulos a CSV por partes
+// @match        https://itaca3.edu.gva.es/itaca3-gac/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+// v3: recorre la paginación de la tabla de módulos y separa los módulos con anotación
+//     en "Tipo predominante" (Aprobada Ant., Convalidada…) de los matriculados.
+// v2: ITACA (ZK) regenera TODOS los ids en cada carga, así que no se usa ninguno.
+// Cada campo se localiza por su etiqueta visible: <span class="z-label">Etiqueta</span> y el
+// campo va a continuación dentro del mismo z-vlayout. La tabla de módulos se reconoce por sus cabeceras.
+
+(function () {
+    'use strict';
+
+    if (window.top !== window.self) return;   // ZK puede cargar iframes: solo en la ventana principal
+
+    // ============================================================
+    // CONFIGURACIÓN
+    // ============================================================
+
+    const ALUMNOS_POR_CSV = 50;        // cada cuántos alumnos se descarga una parte
+    const PAUSA_TRAS_PAGINAR = 1000;   // ms de margen tras cada "Siguiente" (ITACA tarda en pintar)
+    const TIMEOUT_PAGINAR = 20000;     // si en este tiempo no avanza el contador, se para
+    const LECTURAS_ESTABLES = 2;       // lecturas idénticas seguidas antes de dar la ficha por buena
+    const PAUSA_ENTRE_LECTURAS = 350;  // ms entre esas lecturas
+
+    // Etiquetas tal cual aparecen en pantalla (comparación exacta, sin espacios sobrantes)
+    const ETIQUETAS = {
+        alumno: 'Apellidos, Nombre',
+        grupo: 'Grupo',
+        repite: 'Tipo de repetición',
+        modalidad: 'Modalidad',            // Completa / Parcial
+        horas: 'Total horas',
+    };
+    const ETIQUETA_CHECK_PARCIAL = 'Matricula Parcial';   // checkbox, se exporta como comprobación cruzada
+    const CABECERAS_TABLA = ['Código', 'Nombre', 'Tipo predominante', 'Renuncia convocatoria'];
+    const TITULO_SIGUIENTE = 'Cambia al siguiente elemento del listado';
+    const RE_CONTADOR = /^(\d+) de (\d+)$/;
+
+    const ID_BOTON = '__itaca_matriculas_btn';
+    const TOP_BASE = 15;     // mismo top que los otros scripts (se baja solo si hay botones encima)
+    const HUECO = 8;         // separación con el botón de encima
+    const TEXTO_BOTON = '⬇ Exportar matrículas CSV';
+    const COLOR = '#6a1b9a';
+
+    const COLUMNAS = ['Posición', 'Alumno', 'Grupo', 'Repite', 'Modalidad', 'Check parcial', 'Horas',
+        'Nº matriculados', 'Módulos matriculados', 'Nº con anotación', 'Módulos con anotación'];
+
+    let enMarcha = false;
+    let pararPedido = false;
+
+    // ============================================================
+    // BOTÓN
+    // ============================================================
+
+    if (document.getElementById(ID_BOTON)) return;   // ya hay una instancia del script en esta página
+    const boton = document.createElement('button');
+    boton.id = ID_BOTON;
+    boton.type = 'button';
+    boton.textContent = TEXTO_BOTON;
+    boton.style.cssText = `
+        position: fixed; top: ${TOP_BASE}px; right: 15px; z-index: 9999999;
+        padding: 10px 16px; background: ${COLOR}; color: white;
+        border: none; border-radius: 6px; cursor: pointer;
+        font-size: 14px; font-weight: bold;
+        box-shadow: 0 2px 8px rgba(0,0,0,.3); display: none;
+    `;
+    boton.addEventListener('click', () => {
+        if (enMarcha) {
+            pararPedido = true;
+            boton.textContent = '⏳ Parando tras este alumno…';
+            return;
+        }
+        recorrer().catch(err => {
+            console.error('[ITACA matrículas] ERROR:', err);
+            alert('Error en la exportación:\n\n' + err.message);
+        });
+    });
+    document.body.appendChild(boton);
+
+    // Cada segundo: solo se ve en la ficha (si existe el botón "Siguiente") y se recoloca bajo los otros botones.
+    setInterval(() => {
+        const visible = enMarcha || !!botonSiguiente();
+        boton.style.display = visible ? 'block' : 'none';
+        if (visible) colocar();
+    }, 1000);
+
+    // Se pone debajo del botón fijo más bajo de la esquina superior derecha (los de los otros scripts),
+    // así no se solapan aunque cambien de tamaño o aparezcan más tarde.
+    function colocar() {
+        let top = TOP_BASE;
+        for (const el of document.body.children) {
+            if (el === boton) continue;
+            const cs = getComputedStyle(el);
+            if (cs.position !== 'fixed' || cs.display === 'none' || cs.visibility === 'hidden') continue;
+            if ((parseInt(cs.zIndex, 10) || 0) < 99999) continue;      // solo cosas de userscripts, no popups de ZK
+            const r = el.getBoundingClientRect();
+            if (!r.width || !r.height) continue;
+            if (window.innerWidth - r.right > 80 || r.top > 400) continue; // no está en la esquina superior derecha
+            top = Math.max(top, Math.ceil(r.bottom + HUECO));
+        }
+        boton.style.top = top + 'px';
+    }
+
+    // ============================================================
+    // LOCALIZACIÓN (sin ids)
+    // ============================================================
+
+    function botonSiguiente() {
+        const botones = document.querySelectorAll(`button[title="${TITULO_SIGUIENTE}"]`);
+        return botones.length === 1 ? botones[0] : null;   // 0 o varios: no estamos en la ficha (o es ambiguo)
+    }
+
+    function etiquetas(texto) {
+        return [...document.querySelectorAll('span.z-label')].filter(s => limpiar(s.textContent) === texto);
+    }
+
+    // Campo asociado a una etiqueta: el primer campo que va DESPUÉS de la etiqueta dentro del
+    // z-vlayout que la envuelve (se sube como mucho 3 z-vlayout para no pillar el de otro campo).
+    const SEL_CAMPO = 'input.z-combobox-input, input.z-intbox, input.z-textbox, input.z-decimalbox, input.z-datebox-input, span.z-label';
+
+    function campo(clave) {
+        const texto = ETIQUETAS[clave];
+        const encontradas = etiquetas(texto);
+        if (encontradas.length !== 1) {
+            throw new Error(`La etiqueta "${texto}" aparece ${encontradas.length} veces (esperaba 1).`);
+        }
+        const et = encontradas[0];
+        let cont = et.closest('.z-vlayout');
+        for (let i = 0; i < 3 && cont; i++) {
+            const c = [...cont.querySelectorAll(SEL_CAMPO)].find(c =>
+                c !== et && (et.compareDocumentPosition(c) & Node.DOCUMENT_POSITION_FOLLOWING));
+            if (c) return c;
+            cont = cont.parentElement && cont.parentElement.closest('.z-vlayout');
+        }
+        throw new Error(`No encuentro el campo de "${texto}".`);
+    }
+
+    function valor(clave) {
+        const c = campo(clave);
+        return limpiar(c.tagName === 'INPUT' ? c.value : c.textContent);
+    }
+
+    function checkParcial() {
+        const labels = [...document.querySelectorAll('label.z-checkbox-content')]
+            .filter(l => limpiar(l.textContent) === ETIQUETA_CHECK_PARCIAL);
+        if (labels.length !== 1) return '¿?';
+        const input = labels[0].closest('.z-checkbox')?.querySelector('input[type="checkbox"]');
+        return input ? (input.checked ? 'Sí' : 'No') : '¿?';
+    }
+
+    function contadorEl() {
+        const c = [...document.querySelectorAll('span.z-label')].filter(s => RE_CONTADOR.test(limpiar(s.textContent)));
+        return c.length === 1 ? c[0] : null;
+    }
+
+    function leerContador() {
+        const el = contadorEl();
+        const m = el && limpiar(el.textContent).match(RE_CONTADOR);
+        return m ? { actual: +m[1], total: +m[2] } : null;
+    }
+
+    // La tabla de módulos: el listbox cuyas cabeceras incluyen Código, Nombre y Renuncia convocatoria
+    function tablaModulos() {
+        const tablas = [...document.querySelectorAll('div.z-listbox')].filter(lb => {
+            const cab = cabeceras(lb);
+            return CABECERAS_TABLA.every(h => cab.includes(h));
+        });
+        if (tablas.length !== 1) throw new Error(`Tablas de módulos encontradas: ${tablas.length} (esperaba 1).`);
+        return tablas[0];
+    }
+
+    function cabeceras(lb) {
+        return [...lb.querySelectorAll('[id$="-headtbl"] th.z-listheader')].map(th => limpiar(th.textContent));
+    }
+
+    function comprobarElementos() {
+        const faltan = [];
+        if (!botonSiguiente()) faltan.push('botón Siguiente (o hay más de uno)');
+        if (!leerContador()) faltan.push('contador "N de M"');
+        for (const clave of Object.keys(ETIQUETAS)) {
+            try { campo(clave); } catch (e) { faltan.push(e.message); }
+        }
+        try { tablaModulos(); } catch (e) { faltan.push(e.message); }
+        if (faltan.length) throw new Error('No puedo empezar:\n- ' + faltan.join('\n- ') +
+            '\n\nSi algún campo no aparece, abre la pestaña "Datos matrícula" y vuelve a probar.');
+    }
+
+    // ============================================================
+    // LECTURA DE LA FICHA
+    // ============================================================
+
+    // Campos del formulario + la página de módulos que esté a la vista
+    function leerFicha() {
+        const contador = leerContador();
+        return {
+            posicion: contador ? contador.actual : null,
+            alumno: valor('alumno'),
+            grupo: valor('grupo'),
+            repite: valor('repite'),
+            modalidad: valor('modalidad'),
+            parcial: checkParcial(),
+            horas: valor('horas'),
+            paginaModulos: leerPaginaModulos(),
+        };
+    }
+
+    // Filas de la página visible de la tabla de módulos + estado del paginador
+    function leerPaginaModulos() {
+        const tabla = tablaModulos();
+        const cab = cabeceras(tabla);
+        const i = {
+            codigo: cab.indexOf('Código'),
+            nombre: cab.indexOf('Nombre'),
+            anotacion: cab.indexOf('Tipo predominante'),
+            renuncia: cab.indexOf('Renuncia convocatoria'),
+        };
+        const filas = [];
+        for (const tr of tabla.querySelectorAll('tbody[id$="-rows"] > tr.z-listitem')) {
+            const celdas = tr.querySelectorAll(':scope > td.z-listcell');
+            const celda = k => limpiar(celdas[i[k]]?.textContent);
+            const fila = { codigo: celda('codigo'), nombre: celda('nombre'), anotacion: celda('anotacion'), renuncia: celda('renuncia') };
+            if (fila.codigo || fila.nombre) filas.push(fila);
+        }
+        return { ...estadoPaginador(), filas };
+    }
+
+    // Paginador que va justo detrás de la tabla: "[ 11 - 15 / 15 ]"
+    function paginador() {
+        const pags = tablaModulos().parentElement.querySelectorAll(':scope > .z-paging');
+        return pags.length === 1 ? pags[0] : null;
+    }
+
+    function estadoPaginador() {
+        const pg = paginador();
+        const m = pg && limpiar(pg.querySelector('[id$="-info"]')?.textContent).match(/\[\s*(\d+)\s*-\s*(\d+)\s*\/\s*(\d+)\s*\]/);
+        return m ? { desde: +m[1], hasta: +m[2], total: +m[3] } : { desde: null, hasta: null, total: null };
+    }
+
+    function pulsarPaginador(tipo) {   // 'next' | 'first'
+        const a = paginador()?.querySelector(`a.z-paging-${tipo}`);
+        if (!a || a.hasAttribute('disabled')) return false;
+        a.click();
+        return true;
+    }
+
+    // Si la tabla no está en la primera página (p. ej. se quedó en la 2 del alumno anterior), volver a ella
+    async function irAPrimeraPagina() {
+        const { desde } = estadoPaginador();
+        if (desde === null || desde <= 1) return;
+        if (!pulsarPaginador('first')) throw new Error('La tabla de módulos no está en la primera página y no puedo volver a ella.');
+        try { await esperarHasta(() => (estadoPaginador().desde ?? 1) <= 1, TIMEOUT_PAGINAR); }
+        catch { throw new Error('La tabla de módulos no vuelve a la primera página.'); }
+        await esperarZK();
+    }
+
+    // Lee una función hasta que N lecturas seguidas coincidan (por si ITACA aún está repintando)
+    async function leerEstable(lector) {
+        let anterior = null, iguales = 0;
+        const limite = Date.now() + TIMEOUT_PAGINAR;
+        while (Date.now() < limite) {
+            await esperarZK();
+            const actual = JSON.stringify(lector());
+            iguales = actual === anterior ? iguales + 1 : 1;
+            anterior = actual;
+            if (iguales >= LECTURAS_ESTABLES) return JSON.parse(actual);
+            await esperar(PAUSA_ENTRE_LECTURAS);
+        }
+        throw new Error('La ficha no se estabiliza (sigue cambiando entre lecturas).');
+    }
+
+    // Ficha completa: campos + TODAS las páginas de la tabla de módulos
+    async function leerFichaCompleta() {
+        // La tabla puede llegar tarde y en otra página: leer, y si no es la primera, volver y releer
+        let ficha;
+        for (let intento = 1; ; intento++) {
+            await irAPrimeraPagina();
+            ficha = await leerEstable(leerFicha);
+            if ((ficha.paginaModulos.desde ?? 1) <= 1) break;
+            if (intento >= 3) throw new Error(`Ficha ${ficha.posicion}: la tabla de módulos no se queda en la primera página.`);
+        }
+        let pagina = ficha.paginaModulos;
+        const filas = [...pagina.filas];
+
+        while (pagina.total !== null && pagina.hasta < pagina.total) {
+            const desdeAnterior = pagina.desde;
+            if (!pulsarPaginador('next')) {
+                throw new Error(`Ficha ${ficha.posicion}: la tabla de módulos dice ${pagina.hasta} de ${pagina.total} pero no deja pasar de página.`);
+            }
+            try { await esperarHasta(() => estadoPaginador().desde !== desdeAnterior, TIMEOUT_PAGINAR); }
+            catch { throw new Error(`Ficha ${ficha.posicion}: la tabla de módulos no cambia de página.`); }
+            pagina = await leerEstable(leerPaginaModulos);
+            filas.push(...pagina.filas);
+        }
+        await irAPrimeraPagina();   // dejarla como estaba
+
+        // Comprobaciones: ni filas de menos ni páginas repetidas
+        const total = ficha.paginaModulos.total ?? filas.length;
+        if (filas.length !== total) {
+            throw new Error(`Ficha ${ficha.posicion}: he leído ${filas.length} módulos y ITACA dice ${total}.`);
+        }
+        const claves = filas.map(f => `${f.codigo}|${f.nombre}`);
+        if (new Set(claves).size !== claves.length) {
+            throw new Error(`Ficha ${ficha.posicion}: módulos repetidos entre páginas (¿no cambió de página?).`);
+        }
+
+        delete ficha.paginaModulos;
+        ficha.matriculados = filas.filter(f => !f.anotacion).map(textoModulo);
+        ficha.anotados = filas.filter(f => f.anotacion).map(f => `${textoModulo(f)}: ${f.anotacion}`);
+        return ficha;
+    }
+
+    function textoModulo(f) {
+        const base = `${f.codigo} ${f.nombre}`.trim();
+        return f.renuncia ? `${base} [Renuncia: ${f.renuncia}]` : base;
+    }
+
+    function validar(f) {
+        const problemas = [];
+        if (!f.alumno) problemas.push('nombre vacío');
+        if (!f.grupo) problemas.push('grupo vacío');
+        if (!/^\d+$/.test(f.horas)) problemas.push(`horas no numéricas ("${f.horas}")`);
+        if (problemas.length) throw new Error(`Ficha ${f.posicion}: ${problemas.join(', ')}.`);
+    }
+
+    // ============================================================
+    // RECORRIDO
+    // ============================================================
+
+    async function recorrer() {
+        comprobarElementos();
+        const inicio = leerContador();
+        if (inicio.actual !== 1 && !confirm(
+            `Estás en el ${inicio.actual} de ${inicio.total}.\n\n` +
+            `Se exportará desde aquí hasta el ${inicio.total} (${inicio.total - inicio.actual + 1} alumnos).\n` +
+            `Para sacarlos todos, vuelve al primero antes.\n\n¿Seguir desde aquí?`
+        )) return;
+
+        enMarcha = true;
+        pararPedido = false;
+        boton.style.background = '#b26a00';
+        const sello = selloFecha();
+        let lote = [], parte = 0, total = 0;
+
+        const volcar = () => {
+            if (!lote.length) return;
+            parte++;
+            descargarCSV(lote, `itaca_matriculas_${sello}_parte${String(parte).padStart(2, '0')}.csv`);
+            lote = [];
+        };
+
+        try {
+            while (true) {
+                const ficha = await leerFichaCompleta();
+                validar(ficha);
+                lote.push(ficha);
+                total++;
+                boton.textContent = `⏳ ${ficha.posicion} de ${inicio.total} · parte ${parte + 1} — pulsa para parar`;
+                if (lote.length >= ALUMNOS_POR_CSV) volcar();
+
+                const pos = leerContador();
+                if (pos.actual >= pos.total) break;   // último: fin
+                if (pararPedido) break;
+
+                await avanzar(pos.actual);
+            }
+            volcar();
+            boton.textContent = `✓ ${total} alumnos en ${parte} CSV`;
+            boton.style.background = '#287a35';
+            console.log(`[ITACA matrículas] Fin: ${total} alumnos, ${parte} ficheros.`);
+        } catch (err) {
+            volcar();   // lo que ya estaba leído no se pierde
+            boton.textContent = `✗ Parado en ${leerContador()?.actual ?? '?'} (${total} exportados)`;
+            boton.style.background = '#b00020';
+            throw err;
+        } finally {
+            enMarcha = false;
+            setTimeout(() => {
+                if (enMarcha) return;
+                boton.textContent = TEXTO_BOTON;
+                boton.style.background = COLOR;
+            }, 8000);
+        }
+    }
+
+    // Pulsa "Siguiente" y exige que el contador pase exactamente de N a N+1
+    async function avanzar(actual) {
+        const sig = botonSiguiente();
+        if (!sig || sig.disabled) throw new Error(`El botón Siguiente no está disponible en el ${actual}.`);
+        sig.click();
+
+        try {
+            await esperarHasta(() => {
+                const c = leerContador();
+                return c && c.actual !== actual;
+            }, TIMEOUT_PAGINAR);
+        } catch {
+            throw new Error(`Tras pulsar Siguiente el contador sigue en ${actual} (${TIMEOUT_PAGINAR / 1000} s).`);
+        }
+        const nuevo = leerContador().actual;
+        if (nuevo !== actual + 1) throw new Error(`El contador ha saltado de ${actual} a ${nuevo}; paro para no dejar alumnos fuera.`);
+
+        await esperar(PAUSA_TRAS_PAGINAR);
+    }
+
+    // ZK: peticiones AU en curso o máscara de carga visible
+    function zkOcupado() {
+        const zAu = window.zAu;
+        if (zAu && typeof zAu.processing === 'function' && zAu.processing()) return true;
+        return [...document.querySelectorAll('.z-loading, .z-apply-loading, .z-apply-mask, .z-modal-mask')]
+            .some(e => e.offsetParent !== null);
+    }
+
+    async function esperarZK() {
+        try { await esperarHasta(() => !zkOcupado(), TIMEOUT_PAGINAR); }
+        catch { throw new Error('ITACA sigue cargando después de ' + TIMEOUT_PAGINAR / 1000 + ' s.'); }
+    }
+
+    // ============================================================
+    // CSV
+    // ============================================================
+
+    function descargarCSV(fichas, nombre) {
+        const escapar = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+        const filas = [COLUMNAS.map(escapar).join(';')];
+        for (const f of fichas) {
+            filas.push([
+                f.posicion, f.alumno, f.grupo, f.repite, f.modalidad, f.parcial, f.horas,
+                f.matriculados.length, f.matriculados.join(' | '),
+                f.anotados.length, f.anotados.join(' | '),
+            ].map(escapar).join(';'));
+        }
+        const blob = new Blob(['\uFEFF' + filas.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = nombre;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        console.log(`[ITACA matrículas] Descargado ${nombre} (${fichas.length} alumnos)`);
+    }
+
+    // ============================================================
+    // UTILIDADES
+    // ============================================================
+
+    function limpiar(texto) {
+        return String(texto ?? '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function esperar(ms) {
+        return new Promise(r => setTimeout(r, ms));
+    }
+
+    async function esperarHasta(condicion, timeout) {
+        const inicio = Date.now();
+        while (Date.now() - inicio < timeout) {
+            if (condicion()) return;
+            await esperar(100);
+        }
+        throw new Error('timeout');
+    }
+
+    function selloFecha() {
+        const d = new Date();
+        const p = n => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`;
+    }
+})();

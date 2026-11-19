@@ -1,0 +1,187 @@
+// ==UserScript==
+// @name         Exportar alumnos ITACA-grupo a CSV
+// @namespace    alumnos-imc-export
+// @version      1.0
+// @description  Exporta todos los bloques .imc-nom (apellidos, nombre, grupo, módulo, singularidad) a CSV
+// @match        https://docent.edu.gva.es/md-front/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ============================================================
+    // CONFIGURACIÓN
+    // ============================================================
+
+    const SEL_ITEM = '.imc-nom';
+    const ID_BOTON = '__btn_exportar_imc';
+
+    // Columnas del CSV (orden de salida)
+    const COLUMNAS = ['Apellidos', 'Nombre', 'Grupo', 'Módulo', 'Singularidad', 'Singularidad (descripción)'];
+
+    // true  => si un alumno aparece repetido con el mismo grupo/módulo, solo sale una vez
+    const DEDUPLICAR = true;
+
+    // ============================================================
+    // BOTÓN (espera a que haya .imc-nom; vale para páginas que cargan tarde)
+    // ============================================================
+
+    esperarHasta(() => document.querySelector(SEL_ITEM), 30000)
+        .then(crearBoton)
+        .catch(() => { /* esta página no tiene alumnos: no hacemos nada */ });
+
+    function crearBoton() {
+        if (document.getElementById(ID_BOTON)) return;
+
+        const boton = document.createElement('button');
+        boton.id = ID_BOTON;
+        boton.textContent = '⬇ Exportar alumnos CSV';
+        boton.style.cssText = `
+            position: fixed; top: 45px; right: 15px; z-index: 9999999;
+            padding: 10px 16px; background: #164a7b; color: white;
+            border: none; border-radius: 6px; cursor: pointer;
+            font-size: 14px; font-weight: bold;
+            box-shadow: 0 2px 8px rgba(0,0,0,.3);
+        `;
+
+        boton.addEventListener('click', async () => {
+            try {
+                const datos = extraer();
+                console.log(`[IMC] ${datos.length} registros`, datos);
+                descargarCSV(datos);
+                boton.textContent = `✓ ${datos.length} alumnos exportados`;
+                boton.style.background = '#287a35';
+            } catch (error) {
+                console.error('[IMC] ERROR:', error);
+                alert('Error durante la exportación:\n\n' + error.message);
+            }
+            await esperar(4000);
+            boton.textContent = '⬇ Exportar alumnos CSV';
+            boton.style.background = '#164a7b';
+        });
+
+        document.body.appendChild(boton);
+        console.log('[IMC] Exportador preparado.');
+    }
+
+    // ============================================================
+    // EXTRACCIÓN
+    // ============================================================
+
+    function extraer() {
+        const items = [...document.querySelectorAll(SEL_ITEM)];
+        const vistos = new Set();
+        const datos = [];
+
+        for (const item of items) {
+            const r = extraerItem(item);
+            if (!r) continue;
+
+            if (DEDUPLICAR) {
+                const clave = `${r['Apellidos']}|${r['Nombre']}|${r['Grupo']}|${r['Módulo']}`;
+                if (vistos.has(clave)) continue;
+                vistos.add(clave);
+            }
+            datos.push(r);
+        }
+
+        if (!datos.length) throw new Error('No he encontrado ningún alumno.');
+        return datos;
+    }
+
+    function extraerItem(item) {
+        const nombreCompleto = limpiar(item.querySelector('strong')?.textContent);
+        if (!nombreCompleto) return null;
+
+        // "apellidos, nombre" -> se parte por la ÚLTIMA coma
+        const coma = nombreCompleto.lastIndexOf(',');
+        const apellidos = coma >= 0 ? limpiar(nombreCompleto.slice(0, coma)) : nombreCompleto;
+        const nombre = coma >= 0 ? limpiar(nombreCompleto.slice(coma + 1)) : '';
+
+        // Singularidad (AA, CO, etc.) -> puede haber varias
+        const span = item.querySelector('.imc-grupo');
+        const singularidades = span ? [...span.querySelectorAll('.imc-singularitat')] : [];
+        const codSing = singularidades.map(e => limpiar(e.textContent)).join(' ');
+        const descSing = singularidades
+            .map(e => limpiar(e.getAttribute('title') || e.getAttribute('aria-label')))
+            .join(' | ');
+
+        // Texto del grupo sin las singularidades: "2CFSQ - Entornos de Desarrollo"
+        let textoGrupo = '';
+        if (span) {
+            const copia = span.cloneNode(true);
+            copia.querySelectorAll('.imc-singularitat').forEach(e => e.remove());
+            textoGrupo = limpiar(copia.textContent);
+        }
+        const guion = textoGrupo.indexOf(' - ');
+        const grupo = guion >= 0 ? textoGrupo.slice(0, guion).trim() : textoGrupo;
+        const modulo = guion >= 0 ? textoGrupo.slice(guion + 3).trim() : '';
+
+        return {
+            'Apellidos': apellidos,
+            'Nombre': nombre,
+            'Grupo': grupo,
+            'Módulo': modulo,
+            'Singularidad': codSing,
+            'Singularidad (descripción)': descSing,
+        };
+    }
+
+    // ============================================================
+    // CSV
+    // ============================================================
+
+    function descargarCSV(datos) {
+        const escapar = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+
+        const filas = [COLUMNAS.map(escapar).join(';')];
+        for (const r of datos) filas.push(COLUMNAS.map(c => escapar(r[c])).join(';'));
+
+        const blob = new Blob(['\uFEFF' + filas.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `alumnos_imc_${moduloComun(datos)}${fechaActual()}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    // Si todos son del mismo módulo, lo mete en el nombre del fichero
+    function moduloComun(datos) {
+        const modulos = new Set(datos.map(d => d['Módulo']));
+        if (modulos.size !== 1) return '';
+        const m = [...modulos][0];
+        return m ? m.replace(/[^\wÀ-ÿ-]+/g, '_') + '_' : '';
+    }
+
+    // ============================================================
+    // UTILIDADES
+    // ============================================================
+
+    function limpiar(texto) {
+        return String(texto ?? '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function esperar(ms) {
+        return new Promise(r => setTimeout(r, ms));
+    }
+
+    async function esperarHasta(condicion, timeout) {
+        const inicio = Date.now();
+        while (Date.now() - inicio < timeout) {
+            if (condicion()) return;
+            await esperar(200);
+        }
+        throw new Error('timeout');
+    }
+
+    function fechaActual() {
+        const d = new Date();
+        return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'),
+            String(d.getDate()).padStart(2, '0')].join('-');
+    }
+})();

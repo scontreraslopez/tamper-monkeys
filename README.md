@@ -15,6 +15,12 @@ Los datos con información personal (PII) de alumnado, familias, etc. **no deben
 | Script | Sitio | Qué hace |
 | --- | --- | --- |
 | [`Aules · Pendientes de corregir-1.0.txt`](./Aules%20·%20Pendientes%20de%20corregir-1.0.txt) | Aules (`aules.edu.gva.es`) | En la portada de un curso, muestra bajo cada tarea cuántas entregas quedan por corregir. |
+| [`Exportar participantes Aules a CSV-1.0.txt`](./Exportar%20participantes%20Aules%20a%20CSV-1.0.txt) | Aules (`aules.edu.gva.es`) | Exporta los participantes de un curso a CSV. |
+| [`Exportar alumnos ITACA-grupo a CSV-1.0.txt`](./Exportar%20alumnos%20ITACA-grupo%20a%20CSV-1.0.txt) | Docent (`docent.edu.gva.es/md-front`) | Exporta los alumnos del grupo (apellidos, nombre, grupo, módulo, singularidad) a CSV. |
+| [`ITACA · Exportar matrículas (recorrido alumno a alumno)-3.0.txt`](./ITACA%20·%20Exportar%20matrículas%20%28recorrido%20alumno%20a%20alumno%29-3.0.txt) | ITACA (`itaca3.edu.gva.es/itaca3-gac`) | Recorre la ficha de matrícula con "Siguiente" y exporta alumno, grupo, repite, modalidad, horas y módulos a CSV por partes. |
+| [`Exportar alumnos SAO-GESTION a CSV-1.0.txt`](./Exportar%20alumnos%20SAO-GESTION%20a%20CSV-1.0.txt) | SAO-Gestión (`@match *://*/*`) | Exporta el grid de alumnos (ZK) a CSV, con o sin paginador. |
+| [`Exportar empresas SAO-Gestion (ITACA) a CSV-1.1.txt`](./Exportar%20empresas%20SAO-Gestion%20%28ITACA%29%20a%20CSV-1.1.txt) | SAO-Gestión (`@match *://*/*`) | Exporta todas las empresas del grid ZK a CSV bajo demanda. |
+| [`Exportar empresas FCT a CSV-1.0.txt`](./Exportar%20empresas%20FCT%20a%20CSV-1.0.txt) | FCT (`@match *://*/index.php*`) | Recorre todas las páginas del listado de empresas FCT y exporta un CSV. |
 
 ## Instalación
 
